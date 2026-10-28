@@ -1,10 +1,16 @@
-"""Download and display the first 10 books from Books to Scrape."""
+"""Collect 10 books and save new titles to Supabase."""
+
+import argparse
+from decimal import Decimal
 
 import requests
 from bs4 import BeautifulSoup
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preview", action="store_true", help="Display books without saving")
+    args = parser.parse_args()
     # Download the first page. A timeout prevents waiting forever.
     url = "https://books.toscrape.com/"
     try:
@@ -38,6 +44,38 @@ def main():
         print(f"{number}. {title} — {price}")
 
     print(f"\nCollected {len(results)} books.")
+
+    if not args.preview:
+        from database import get_database, save_books
+
+        # Remove the currency symbol; Supabase's numeric column needs a number.
+        rows = [
+            {"title": title, "price": float(Decimal(price.removeprefix("£")))}
+            for title, price in results
+        ]
+        try:
+            saved = save_books(rows)
+            # Read the actual database rows back to verify titles and numeric prices.
+            stored = (
+                get_database().table("books").select("title, price")
+                .in_("title", [row["title"] for row in rows]).execute().data
+            )
+        except Exception:
+            raise SystemExit(
+                "Supabase upload failed. Check .env and Data API access. "
+                "Check your table before retrying to avoid duplicates."
+            ) from None
+        print(f"Saved {len(saved)} new books; skipped {len(rows) - len(saved)} existing titles.")
+        for book in rows:
+            matches = [row for row in stored if row["title"] == book["title"]]
+            if not matches:
+                raise SystemExit("Verification failed: a scraped title is missing from Supabase.")
+            if not any(Decimal(str(row["price"])) == Decimal(str(book["price"])) for row in matches):
+                raise SystemExit(
+                    f"Existing price differs for: {book['title']}. "
+                    "The existing record was left unchanged."
+                )
+        print("Verified all 10 titles and prices by reading them back from Supabase.")
 
 
 # Run main() when this file is executed directly.
