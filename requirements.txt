@@ -1,0 +1,4 @@
+requests==2.32.5
+beautifulsoup4==4.13.5
+# Compatible with the LibreSSL library in macOS's bundled Python 3.9.
+urllib3==1.26.20
