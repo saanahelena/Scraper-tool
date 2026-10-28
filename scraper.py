@@ -1,83 +1,102 @@
-"""Collect 10 books and save new titles to Supabase."""
+"""Scrape up to 50 pages of books and save new books to Supabase."""
 
 import argparse
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import time
 
 import requests
 from bs4 import BeautifulSoup
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preview", action="store_true", help="Display books without saving")
-    args = parser.parse_args()
-    # Download the first page. A timeout prevents waiting forever.
-    url = "https://books.toscrape.com/"
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()  # Report HTTP errors, such as a missing page.
-    except requests.RequestException as error:
-        raise SystemExit(f"Could not download the books: {error}")
+def scrape_page(session, page):
+    """Download one page and turn its 20 book cards into dictionaries."""
+    url = f"https://books.toscrape.com/catalogue/page-{page}.html"
+    # Retry failed downloads twice, with a pause. Never retry database inserts blindly.
+    for attempt in range(3):
+        try:
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+            break
+        except requests.RequestException:
+            if attempt == 2:
+                raise SystemExit(f"Could not download page {page} after 3 attempts. Run again later.") from None
+            print(f"Page {page}: download failed; retrying shortly.", flush=True)
+            time.sleep(2 * (attempt + 1))
 
-    # UTF-8 makes sure the pound symbol (£) displays correctly.
     response.encoding = "utf-8"
     soup = BeautifulSoup(response.text, "html.parser")
+    cards = soup.select("article.product_pod")
+    if len(cards) != 20:
+        raise SystemExit(f"Page {page}: expected 20 books; found {len(cards)}. The site may have changed.")
 
-    # Each article with class 'product_pod' contains one book.
-    books = soup.select("article.product_pod")[:10]
-    if len(books) != 10:
-        raise SystemExit("Expected 10 books. The website layout may have changed.")
+    books = []
+    for card in cards:
+        link = card.select_one("h3 a")
+        price_tag = card.select_one("p.price_color")
+        if link is None or not link.get("title") or price_tag is None:
+            raise SystemExit(f"Page {page}: a title or price is missing.")
+        price_text = price_tag.get_text(strip=True)
+        try:
+            if not price_text.startswith("£"):
+                raise ValueError("Expected GBP")
+            price = Decimal(price_text[1:])
+            if not price.is_finite() or price < 0:
+                raise ValueError("Invalid price")
+        except (InvalidOperation, ValueError):
+            raise SystemExit(f"Page {page}: found an invalid GBP price.") from None
+        books.append({"title": link["title"], "price": float(price)})
+    return books
 
-    results = []
-    for book in books:
-        title_link = book.select_one("h3 a")
-        price_tag = book.select_one("p.price_color")
-        if title_link is None or price_tag is None or not title_link.get("title"):
-            raise SystemExit("Could not find a title or price. The page may have changed.")
 
-        # The title attribute contains the full title, even when displayed text is shortened.
-        title = title_link["title"]
-        price = price_tag.get_text(strip=True)
-        results.append((title, price))
-
-    for number, (title, price) in enumerate(results, start=1):
-        print(f"{number}. {title} — {price}")
-
-    print(f"\nCollected {len(results)} books.")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pages", type=int, default=50, help="Pages to process, from 1 to 50 (default: 50)")
+    parser.add_argument("--preview", action="store_true", help="Display books without using Supabase")
+    args = parser.parse_args()
+    if not 1 <= args.pages <= 50:
+        parser.error("--pages must be between 1 and 50")
 
     if not args.preview:
-        from database import get_database, save_books
+        from database import get_database, save_books, verify_books
+        database = get_database()
 
-        # Remove the currency symbol; Supabase's numeric column needs a number.
-        rows = [
-            {"title": title, "price": float(Decimal(price.removeprefix("£")))}
-            for title, price in results
-        ]
-        try:
-            saved = save_books(rows)
-            # Read the actual database rows back to verify titles and numeric prices.
-            stored = (
-                get_database().table("books").select("title, price")
-                .in_("title", [row["title"] for row in rows]).execute().data
+    processed = saved_total = skipped_total = 0
+    with requests.Session() as session:
+        for page in range(1, args.pages + 1):
+            if page > 1:
+                time.sleep(1)  # Be polite: leave a small gap between page requests.
+            books = scrape_page(session, page)
+            if args.preview:
+                for book in books:
+                    print(f"{book['title']} — £{book['price']:.2f}")
+            else:
+                try:
+                    saved = save_books(books, database)
+                    verify_books(books, database)
+                except Exception:
+                    raise SystemExit(
+                        f"Page {page}: database save or read-back verification failed. "
+                        "Previous pages remain saved. Check your connection and Data API access, "
+                        "then rerun: matching books will be skipped. Credentials are not shown."
+                    ) from None
+                saved_total += len(saved)
+                skipped_total += len(books) - len(saved)
+            processed += len(books)
+            print(
+                f"Page {page}/{args.pages} complete | Books processed: {processed}"
+                + (" (preview)" if args.preview else
+                   f" | New: {saved_total} | Already saved: {skipped_total} | Verified: {processed}"),
+                flush=True,
             )
-        except Exception:
-            raise SystemExit(
-                "Supabase upload failed. Check .env and Data API access. "
-                "Check your table before retrying to avoid duplicates."
-            ) from None
-        print(f"Saved {len(saved)} new books; skipped {len(rows) - len(saved)} existing titles.")
-        for book in rows:
-            matches = [row for row in stored if row["title"] == book["title"]]
-            if not matches:
-                raise SystemExit("Verification failed: a scraped title is missing from Supabase.")
-            if not any(Decimal(str(row["price"])) == Decimal(str(book["price"])) for row in matches):
-                raise SystemExit(
-                    f"Existing price differs for: {book['title']}. "
-                    "The existing record was left unchanged."
-                )
-        print("Verified all 10 titles and prices by reading them back from Supabase.")
+
+    print(f"Finished: {args.pages} pages, {processed} books processed.")
+    if not args.preview:
+        print(f"Saved {saved_total} new books; skipped {skipped_total} matches.")
+        print(f"Verified all {processed} scraped titles and GBP prices by reading them back from Supabase.")
 
 
-# Run main() when this file is executed directly.
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit("Stopped. Completed pages remain saved; rerun to continue safely.") from None

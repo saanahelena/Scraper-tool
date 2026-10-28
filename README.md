@@ -1,12 +1,13 @@
 # Book scraper
 
-A beginner Python project that collects and saves the first 10 book titles and prices from
-[Books to Scrape](https://books.toscrape.com/), a website made for scraping practice.
-Its prices are fictional. Books are saved in Supabase using your local `.env` settings.
+A beginner Python scraper for [Books to Scrape](https://books.toscrape.com/),
+which provides 1,000 practice books across 50 pages. Prices are fictional GBP.
+It collects full titles and prices, saves new books to Supabase, and reads them
+back to verify the saved values.
 
-## Set up on macOS
+## Setup on macOS
 
-Open a terminal in this repository's folder and run:
+Open a terminal in this repository:
 
 ```sh
 python3 -m venv .venv
@@ -14,114 +15,108 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-- The first command creates an isolated Python environment in `.venv`.
-- The second activates it for this terminal. Repeat this when opening a new terminal.
-- The third installs the packages listed in `requirements.txt` into that environment.
+The environment keeps this project's packages separate. If you already set it up,
+just activate it with `source .venv/bin/activate`.
 
-## Run
+## Configure Supabase once
 
-With the environment activated and `.env` configured (see below), run:
+Your existing `public.books` table needs these columns:
+
+| Column | Type | Default |
+| --- | --- | --- |
+| id | int8 primary key | Automatically generated |
+| created_at | timestamptz | now() |
+| title | text | |
+| price | numeric | |
+
+Python sends only title and price. The table structure is not changed.
+
+If you do not already have `.env`, copy the placeholder template:
+
+```sh
+cp -n .env.example .env
+```
+
+Open `.env` privately in your editor. In your Supabase dashboard:
+
+1. Open **Connect** and copy the **Project URL** into `SUPABASE_URL`.
+2. Open **Settings → API Keys** and copy a secret key (`sb_secret_...`) into
+   `SUPABASE_SECRET_KEY`. Create one if needed.
+3. Save `.env`. Use the API project URL, not a database connection string.
+
+The secret key has elevated access and bypasses Row Level Security. Keep it in
+this trusted local script's environment; never share it in chat, screenshots,
+browser code, or Git. `.env` is ignored by Git. `.env.example` has placeholders only.
+See [Supabase's API key guide](https://supabase.com/docs/guides/getting-started/api-keys).
+
+For an initial connection check, `python check_supabase.py` inserts and reads one
+clearly named test book. Each run of that separate test adds a test row.
+You do not need to repeat it once the connection works.
+
+## Test two pages first
+
+```sh
+python scraper.py --pages 2
+```
+
+This processes 40 books, saves new matches, and checks their titles and prices by
+reading them back. It reports progress after every completed page.
+
+## Run all 50 pages
 
 ```sh
 python scraper.py
 ```
 
-You should see 10 numbered titles and prices, followed by `Collected 10 books.`
-The scraper automatically saves new titles and reads all 10 back to verify prices.
-Running it again skips titles already in the table. Existing records stay unchanged.
-You need an internet connection. Download errors appear as a readable message.
+The default is 50 pages, or 1,000 books. It pauses one second between pages, so
+allow a few minutes for website and database requests. Progress shows pages,
+books processed, new books saved, existing matches skipped, and books verified.
+The final line confirms all 1,000 scraped titles and GBP prices were read back.
 
-To display books without connecting to Supabase, run `python scraper.py --preview`.
-
-You can also run without activating the environment:
+You can run without activating the environment with `.venv/bin/python scraper.py`.
+To display books without accessing Supabase, use:
 
 ```sh
-.venv/bin/python scraper.py
+python scraper.py --pages 2 --preview
 ```
+
+Open **Supabase → Table Editor → books** to see the saved records. Your total
+row count also includes manually entered books and any connection-test rows.
 
 ## How it works
 
-1. `requests` downloads the homepage in one request.
-2. `BeautifulSoup` reads the HTML, the code describing the webpage.
-3. `select("article.product_pod")[:10]` finds book cards and keeps the first 10.
-4. For each card, `h3 a` finds the title link and `p.price_color` finds the price.
-5. The loop prints each full title and its price in British pounds.
-6. `database.py` reads the credentials from `.env` and checks which titles exist.
-7. New books are inserted with numeric prices (for example, `51.77` without `£`).
-8. The scraper reads the books back and verifies their titles and prices.
+1. `requests` downloads each catalogue page with a 30-second timeout.
+2. `BeautifulSoup` finds the 20 book cards on each page.
+3. The link's `title` attribute supplies the full title, including text shortened
+   on the visible page. The price is checked as GBP and converted from `£51.77`
+   to the number `51.77` for the database's numeric column.
+4. `database.py` uses the existing `.env` connection and checks title/price pairs
+   in small batches. It paginates reads to avoid database response-size limits.
+5. Only new pairs are inserted; saved rows are read back and compared using
+   `Decimal` so equivalent numeric formats match.
 
-The scraper only reads the first page; it does not need to visit individual books.
-The comments in `scraper.py` explain each step.
+## Duplicate prevention and existing records
 
-`.gitignore` keeps the local environment and generated Python files out of Git.
-To leave the environment, run `deactivate`.
+A duplicate is an exact full title plus the same numeric price. Books can share
+a title, so title alone is not used. A different price creates a separate row;
+it never overwrites an existing record. Repeated runs skip matches, including
+matches saved on earlier pages or previous interrupted runs.
 
-## Connect to Supabase: test one book first
+Run one scraper at a time. This application check prevents duplicates during
+sequential runs. Simultaneous writers would require a database unique constraint
+for a strict guarantee. No existing records are updated or deleted, and no
+schema change is performed. Existing duplicates are left untouched.
 
-The database setup expects `public.books` with auto-generated `id`, default
-`created_at`, text `title`, and numeric `price`. Python sends only title and price.
-Your existing manually inserted book is not updated or deleted.
+## Errors and restarting
 
-1. Activate the environment and install the added packages:
+Failed website downloads are retried twice with a pause. Missing book fields,
+invalid prices, or an unexpected number of cards stop the scraper with a message.
+Database errors stop processing without printing credentials. Completed pages
+remain saved; fix the connection and run the command again to skip saved matches.
+Database inserts are not automatically retried because a response can be lost
+after the server has saved the books.
 
-   ```sh
-   source .venv/bin/activate
-   python -m pip install -r requirements.txt
-   ```
-
-2. Copy the credential template once (skip this if you already have `.env`):
-
-   ```sh
-   cp -n .env.example .env
-   ```
-
-3. Open your Supabase project dashboard. The **Connect** dialog shows your
-   **Project URL**. Copy it into `SUPABASE_URL` in your local `.env` file.
-   Open **Settings → API Keys**, find or create a **secret key** (`sb_secret_...`),
-   and copy it into `SUPABASE_SECRET_KEY` in `.env`.
-   Use the API project URL, not a PostgreSQL connection string or database password.
-
-   This is a trusted local script: the secret key has elevated access and bypasses
-   Row Level Security. Keep it private; never paste it in chat, commit it, or use it
-   in browser code. `.gitignore` excludes `.env`, while `.env.example` contains only
-   placeholders. See [Supabase's API key guide](https://supabase.com/docs/guides/getting-started/api-keys).
-
-4. Save `.env`, then run **only the one-book check**:
-
-   ```sh
-   python check_supabase.py
-   ```
-
-   This inserts a book titled `Python connection test book` priced at `12.34`,
-   then reads it back by its generated id and checks the title and price.
-   Success ends with `Success! Python can insert and read a book in Supabase.`
-   The test row stays in your table. Each run adds one new test row, so check your
-   table before retrying if a request fails. Existing rows are left alone.
-
-If the check fails, confirm the URL and secret key locally. Also check that the
-Data API is enabled and `public.books` is exposed with insert/select access for
-the service role in your project's Data API settings. Do not disable RLS or add
-public write policies for this script. Avoid sharing `.env` or raw credential logs.
-
-## Run the complete scraper
-
-After the one-book check succeeds, run:
-
-```sh
-python scraper.py
-```
-
-This removes the `£` symbol and sends new books to Supabase in one batch.
-Supabase generates `id` and `created_at`. Open **Table Editor → books** in the
-Supabase dashboard to see the saved records.
-
-Duplicate detection uses the full, exact title. Repeated runs skip existing titles,
-including manually entered ones, and never update or delete them. If an existing
-title has a different price, verification reports it and leaves it unchanged.
-Run one scraper at a time: this simple check prevents duplicates in sequential
-runs. Simultaneous processes would need a database unique constraint for a strict
-guarantee; this project does not alter your database schema or existing records.
-
-The first run reports how many new books it saved. A second run should report
-`Saved 0 new books; skipped 10 existing titles.` Both should end with
-`Verified all 10 titles and prices by reading them back from Supabase.`
+If Supabase access fails, check `.env` locally, your internet connection, and
+Data API access to `public.books` with insert/select grants for the service role.
+Do not disable RLS or share raw credential logs. Press Ctrl+C to stop the scraper.
+To leave the Python environment, run `deactivate`.
